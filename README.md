@@ -1,77 +1,63 @@
-# Rapport technique : audit et durcissement d'Active Directory (wyrmwood.local)
-
-**Destinataire :** Direction des Systèmes d'Information (DSI)
-**Objet :** constats, risques et plan d'action pour réduire la surface d'attaque Active Directory
-**Date :** 20 novembre 2026
-**Auteur :** [Nom Prénom]
-**Version :** 1.0
-
-> Les preuves (captures d'écran) sont stockées dans le dossier [`screenshots/`](screenshots/) du dépôt. Chaque constat renvoie vers ses captures par un lien cliquable, au format `screenshots/screenshot-<numéro>.png`.
-
----
+# Rapport de TP : durcissement d'un Active Directory (wyrmwood.local)
 
 ## Sommaire
 
-1. [Synthèse pour la direction](#1-synthèse-pour-la-direction)
-2. [Périmètre et objectif de l'analyse](#2-périmètre-et-objectif-de-lanalyse)
-3. [Méthodologie](#3-méthodologie)
-4. [Constat transversal : le danger des paramètres par défaut](#4-constat-transversal--le-danger-des-paramètres-par-défaut)
-5. [Chaîne d'attaque observée](#5-chaîne-dattaque-observée)
+1. [Introduction et résumé](#1-introduction-et-résumé)
+2. [Périmètre et objectif](#2-périmètre-et-objectif)
+3. [Méthode](#3-méthode)
+4. [Le problème de fond : les paramètres par défaut](#4-le-problème-de-fond--les-paramètres-par-défaut)
+5. [Chaîne d'attaque](#5-chaîne-dattaque)
 6. [Tableau de synthèse des constats](#6-tableau-de-synthèse-des-constats)
 7. [Constats détaillés](#7-constats-détaillés)
-8. [Plan d'action proposé](#8-plan-daction-proposé)
-9. [Risques de régression et précautions](#9-risques-de-régression-et-précautions)
-10. [Limites et suites](#10-limites-et-suites)
+8. [Pour aller plus loin : déploiement en production](#8-pour-aller-plus-loin--déploiement-en-production)
+9. [Précautions avant d'appliquer ces corrections](#9-précautions-avant-dappliquer-ces-corrections)
+10. [Limites](#10-limites)
+11. [Aide de l'IA générative](#11-aide-de-lia-générative)
 
 ---
 
-## 1. Synthèse pour la direction
+## 1. Introduction et résumé
 
-L'audit du domaine Active Directory `wyrmwood.local` a mis en évidence **15 constats**. Ils ont tous été corrigés et revérifiés sur les hôtes audités (DC01 et MS01).
+Dans ce TP, j'ai audité puis durci le domaine Active Directory `wyrmwood.local`, dans un lab HackTheBox. J'ai relevé **15 constats**. Je les ai tous corrigés et revérifiés sur les deux machines étudiées (DC01 et MS01).
 
-**Message principal : la première source de faiblesse d'un Active Directory est son paramétrage par défaut.** La plupart des constats ne résultent pas d'une faille logicielle ni d'un attaquant sophistiqué. Ils viennent de protocoles hérités activés par défaut (LLMNR, NBT-NS, IPv6, spouleur d'impression), de contrôles d'intégrité non exigés par défaut (signature LDAP et SMB sur les serveurs membres) et de quotas permissifs (MachineAccountQuota à 10). Un AD installé et laissé en l'état est donc vulnérable.
+**Ce que je retiens : le principal manque de sécurité d'un Active Directory vient de ses paramètres par défaut.** La plupart des problèmes ne viennent pas d'une faille logicielle ou d'un attaquant très fort. Ils viennent de protocoles anciens activés par défaut (LLMNR, NBT-NS, IPv6, spouleur d'impression), de contrôles non exigés par défaut (signature LDAP et SMB sur les serveurs membres) et de quotas trop permissifs (MachineAccountQuota à 10). Un AD installé et laissé tel quel est donc vulnérable.
 
-**Le scénario le plus préoccupant** enchaîne des faiblesses qui ne demandent aucun compte au départ : un attaquant présent sur le réseau usurpe une réponse de résolution de noms, relaie l'authentification NTLM obtenue vers LDAP (non signé), crée un compte machine (quota par défaut) et escalade jusqu'à la compromission du domaine.
-
-**Décisions demandées à la DSI :**
-- valider le plan d'action en 3 vagues (section 8) ;
-- désigner un responsable par chantier et une fenêtre de changement ;
-- valider la phase d'audit préalable (signature LDAP, NTLM) avant tout blocage en production.
+**Le scénario le plus inquiétant** enchaîne plusieurs faiblesses sans avoir besoin d'un compte au départ : l'attaquant, présent sur le réseau, usurpe une réponse de résolution de noms, relaie l'authentification NTLM récupérée vers LDAP (non signé), crée un compte machine (grâce au quota par défaut) et monte jusqu'à la compromission du domaine.
 
 ---
 
-## 2. Périmètre et objectif de l'analyse
+## 2. Périmètre et objectif
 
-**Objectif.** Identifier les mauvaises configurations Active Directory exploitables sans compte privilégié, évaluer leur risque, appliquer et vérifier les corrections, et fournir un plan de déploiement exploitable en production.
+**Objectif.** Trouver les mauvaises configurations de l'AD qu'on peut exploiter sans compte privilégié, évaluer le risque, appliquer les corrections et vérifier qu'elles marchent.
 
 **Environnement.**
 - Forêt `wyrmwood.local`, avec les domaines enfants `ops.wyrmwood.local` et `labs.wyrmwood.local`.
 - Approbation de forêt externe avec `steelridge.industries`.
-- Hôtes audités et durcis : **DC01** (contrôleur de domaine) et **MS01** (serveur membre).
-- Accès par bureau à distance, environnement de laboratoire de type HackTheBox.
-- Énumération non authentifiée réalisée avec NetExec : `netexec smb <IP> --users --pass-pol --rid-brute`.
+- Machines étudiées et durcies : **DC01** (contrôleur de domaine) et **MS01** (serveur membre).
+- Connexion par bureau à distance, lab de type HackTheBox.
+- Énumération sans authentification avec NetExec : `netexec smb <IP> --users --pass-pol --rid-brute`.
 
-**Hors périmètre.** Postes clients, AD CS, environnement hybride (Entra ID), équipements réseau et pare-feu périmétriques, remédiation des domaines enfants et de l'approbation externe (voir section 10).
+**Hors périmètre.** Postes clients, AD CS, environnement hybride (Entra ID), équipements réseau, et la remédiation des domaines enfants et de l'approbation externe (voir section 10).
 
-**Convention de criticité.** Faible / Moyenne / Élevée / Critique. Il s'agit d'une estimation de l'auditeur fondée sur l'exploitabilité sans privilège et l'impact potentiel, sans calcul CVSS.
-
----
-
-## 3. Méthodologie
-
-Pour chaque constat, la démarche est identique :
-
-1. **Constat et preuve** : lecture de l'état initial et capture d'écran commentée.
-2. **Risque, correction et impact** : évaluation du risque, correction appliquée (immédiate puis durable via GPO) et conséquences possibles sur le métier.
-3. **Vérification** : relecture de la configuration après correction et protocole de test pour confirmer que l'attaque n'est plus possible.
-
-Les corrections ont été appliquées en deux temps : **immédiate** (registre ou PowerShell, effet direct) puis **durable** (GPO dédiée, plus facile à auditer, à cibler par UO et à annuler que la modification de la Default Domain Policy).
+**Criticité.** Faible, Moyenne, Élevée ou Critique. C'est mon estimation (facilité d'exploitation sans privilège et impact possible), sans calcul CVSS.
 
 ---
 
-## 4. Constat transversal : le danger des paramètres par défaut
+## 3. Méthode
 
-Un Active Directory est conçu pour la compatibilité et la facilité d'administration avant la sécurité. Cela se voit dans ses réglages d'origine :
+Pour chaque constat, je suis les mêmes étapes :
+
+1. **Constat et preuve** : je lis l'état initial et je le montre avec une capture commentée.
+2. **Risque, correction et impact** : j'explique le risque, j'applique la correction (d'abord immédiate, puis durable avec une GPO) et je note ce que ça peut casser.
+3. **Vérification** : je relis la configuration après correction et je propose un test pour confirmer que l'attaque ne marche plus.
+
+Pour rendre les corrections durables, j'ai créé des GPO dédiées plutôt que de modifier la Default Domain Policy. C'est plus facile à auditer, à cibler par UO et à annuler.
+
+---
+
+## 4. Le problème de fond : les paramètres par défaut
+
+Un Active Directory est pensé pour être compatible et facile à administrer avant d'être sécurisé. Ça se voit dans ses réglages d'origine :
 
 | Réglage | Valeur d'origine | Valeur sécurisée |
 |---|---|---|
@@ -81,16 +67,16 @@ Un Active Directory est conçu pour la compatibilité et la facilité d'administ
 | LLMNR | Activé | Désactivé |
 | NBT-NS (NetBIOS sur TCP/IP) | Activé | Désactivé |
 | IPv6 / DHCPv6 / Router Advertisements | Activés et acceptés | Désactivés ou filtrés |
-| Spouleur d'impression sur DC | Activé | Désactivé |
+| Spouleur d'impression sur un DC | Activé | Désactivé |
 | Politique de mot de passe | Longueur minimale 7, aucun verrouillage de compte | 12 à 14 caractères, verrouillage activé |
 
-Tous les constats ne sont pas des défauts purs. Quatre relèvent d'une configuration locale ou héritée : le paramètre `dSHeuristics` (F-02), l'appartenance de `Everyone` et `ANONYMOUS LOGON` au groupe Pre-Windows 2000 (F-03), les comptes sans pré-authentification Kerberos (F-13) et le partage `Transfer` ouvert en écriture (F-15). La majorité des autres découle des défauts ci-dessus.
+Tous les constats ne sont pas des défauts purs. Quatre viennent plutôt d'une configuration locale ou héritée : le paramètre `dSHeuristics` (F-02), la présence d'`Everyone` et `ANONYMOUS LOGON` dans le groupe Pre-Windows 2000 (F-02 et F-03), les comptes sans pré-authentification Kerberos (F-13) et le partage `Transfer` ouvert en écriture (F-15). Pour tout le reste, le problème vient des réglages par défaut.
 
-**Conséquence organisationnelle :** le durcissement doit faire partie du processus de déploiement (« secure by build »), avec une GPO de référence appliquée dès la création du domaine, et non d'une opération ponctuelle après coup.
+**Ce que ça implique :** le durcissement devrait faire partie du déploiement dès le départ (une GPO de référence dès la création du domaine), et pas seulement être fait après coup.
 
 ---
 
-## 5. Chaîne d'attaque observée
+## 5. Chaîne d'attaque
 
 ```mermaid
 flowchart LR
@@ -110,29 +96,29 @@ flowchart LR
     K --> L
 ```
 
-Le relais NTLM ne se bloque pas par un réglage unique : il exige une **combinaison de contrôles** (suppression de l'usurpation, signature SMB et LDAP, channel binding, quota de comptes machine, réduction de la coercition).
+Le relais NTLM ne se bloque pas avec un seul réglage. Il faut combiner plusieurs contrôles : supprimer l'usurpation, exiger la signature SMB et LDAP, activer le channel binding, mettre le quota de comptes machine à 0 et réduire la coercition.
 
 ---
 
 ## 6. Tableau de synthèse des constats
 
-| ID | Constat | Criticité | Risque de régression | Preuves |
+| ID | Constat | Criticité | Risque de régression | Captures |
 |---|---|---|---|---|
-| F-01 | Session nulle SMB sur le DC | Élevée | Moyen | [7](screenshots/screenshot-7.png) · [8](screenshots/screenshot-8.png) · [10](screenshots/screenshot-10.png) · [11](screenshots/screenshot-11.png) |
-| F-02 | Opérations LDAP anonymes autorisées (`dSHeuristics`) | Élevée | Moyen | [12](screenshots/screenshot-12.png) · [13](screenshots/screenshot-13.png) · [14](screenshots/screenshot-14.png) · [15](screenshots/screenshot-15.png) · [16](screenshots/screenshot-16.png) |
-| F-03 | `Everyone` et `ANONYMOUS LOGON` dans Pre-Windows 2000 Compatible Access | Moyenne | Faible | [20](screenshots/screenshot-20.png) · [21](screenshots/screenshot-21.png) · [22](screenshots/screenshot-22.png) |
-| F-04 | RID brute force possible | Moyenne | Faible | [36](screenshots/screenshot-36.png) · [37](screenshots/screenshot-37.png) · [38](screenshots/screenshot-38.png) |
-| F-05 | LLMNR actif | Élevée | Faible | [59](screenshots/screenshot-59.png) · [60](screenshots/screenshot-60.png) · [61](screenshots/screenshot-61.png) |
-| F-06 | NBT-NS actif | Élevée | Moyen | [62](screenshots/screenshot-62.png) · [63](screenshots/screenshot-63.png) · [64](screenshots/screenshot-64.png) |
-| F-07 | Usurpation DNS via IPv6 (mitm6) | Élevée | Élevé | [41](screenshots/screenshot-41.png) à [52](screenshots/screenshot-52.png) |
-| F-08 | Signature SMB non exigée | Élevée | Moyen | [53](screenshots/screenshot-53.png) · [54](screenshots/screenshot-54.png) · [55](screenshots/screenshot-55.png) |
-| F-09 | Signature LDAP non exigée | **Critique** | Élevé | [56](screenshots/screenshot-56.png) · [57](screenshots/screenshot-57.png) · [58](screenshots/screenshot-58.png) |
-| F-10 | MachineAccountQuota par défaut (10) | Élevée | Moyen | [1](screenshots/screenshot-1.png) · [2](screenshots/screenshot-2.png) · [3](screenshots/screenshot-3.png) |
-| F-11 | Mots de passe faibles autorisés (GPO) | Élevée | Moyen | [4](screenshots/screenshot-4.png) · [5](screenshots/screenshot-5.png) · [6](screenshots/screenshot-6.png) |
-| F-12 | Politique de mot de passe AD faible | Moyenne | Moyen | [17](screenshots/screenshot-17.png) · [18](screenshots/screenshot-18.png) · [19](screenshots/screenshot-19.png) |
-| F-13 | Comptes sans pré-authentification Kerberos (AS-REP Roasting) | Élevée | Faible | [26](screenshots/screenshot-26.png) · [27](screenshots/screenshot-27.png) · [28](screenshots/screenshot-28.png) |
-| F-14 | Spouleur d'impression actif sur le DC | Élevée | Faible sur DC | [29](screenshots/screenshot-29.png) · [30](screenshots/screenshot-30.png) · [31](screenshots/screenshot-31.png) |
-| F-15 | Partage `Transfer` modifiable par les utilisateurs non privilégiés | Élevée | Moyen | [32](screenshots/screenshot-32.png) · [33](screenshots/screenshot-33.png) · [34](screenshots/screenshot-34.png) · [35](screenshots/screenshot-35.png) |
+| F-01 | Session nulle SMB sur le DC | Élevée | Moyen | 7, 8, 10, 11 |
+| F-02 | Opérations LDAP anonymes autorisées (`dSHeuristics`) | Élevée | Moyen | 12 à 16 |
+| F-03 | `Everyone` et `ANONYMOUS LOGON` dans Pre-Windows 2000 Compatible Access | Moyenne | Faible | 20, 21, 22 |
+| F-04 | RID brute force possible | Moyenne | Faible | 36, 37, 38 |
+| F-05 | LLMNR actif | Élevée | Faible | 59, 60, 61 |
+| F-06 | NBT-NS actif | Élevée | Moyen | 62, 63, 64 |
+| F-07 | Usurpation DNS via IPv6 (mitm6) | Élevée | Élevé | 41 à 52 |
+| F-08 | Signature SMB non exigée | Élevée | Moyen | 53, 54, 55 |
+| F-09 | Signature LDAP non exigée | **Critique** | Élevé | 56, 57, 58 |
+| F-10 | MachineAccountQuota par défaut (10) | Élevée | Moyen | 1, 2, 3 |
+| F-11 | Mots de passe faibles autorisés (GPO) | Élevée | Moyen | 4, 5, 6 |
+| F-12 | Politique de mot de passe AD faible | Moyenne | Moyen | 17, 18, 19 |
+| F-13 | Comptes sans pré-authentification Kerberos (AS-REP Roasting) | Élevée | Faible | 26, 27, 28 |
+| F-14 | Spouleur d'impression actif sur le DC | Élevée | Faible sur un DC | 29, 30, 31 |
+| F-15 | Partage `Transfer` modifiable par les utilisateurs non privilégiés | Élevée | Moyen | 32 à 35 |
 
 ---
 
@@ -141,200 +127,436 @@ Le relais NTLM ne se bloque pas par un réglage unique : il exige une **combinai
 ### Thème A : énumération anonyme
 
 #### F-01 : Session nulle SMB sur le contrôleur de domaine
-**Criticité :** Élevée · **Preuves :** [7](screenshots/screenshot-7.png), [8](screenshots/screenshot-8.png), [10](screenshots/screenshot-10.png), [11](screenshots/screenshot-11.png)
+**Criticité :** Élevée
 
-- **Constat :** une session anonyme pouvait se connecter au partage `IPC$` du DC et énumérer les utilisateurs, les groupes et la politique de mot de passe. `RestrictAnonymous` valait 0.
-- **Risque :** l'attaquant obtient sans authentification la liste des comptes et les règles de verrouillage, ce qui permet un password spraying ciblé et sûr.
-- **Correction :** `RestrictAnonymous` passé de 0 à 2 et `RestrictAnonymousSAM` à 1 (clé `HKLM\SYSTEM\CurrentControlSet\Control\Lsa`), poussés par la Default Domain Controllers Policy ; `Everyone` et `ANONYMOUS LOGON` retirés du groupe Pre-Windows 2000 Compatible Access (voir F-03) ; `gpupdate /force`.
-- **Impact possible :** des outils ou scripts hérités qui utilisent `IPC$` en anonyme cessent de fonctionner. À inventorier avant déploiement.
-- **Vérification :** valeurs de registre relues (`RestrictAnonymous = 2`, `RestrictAnonymousSAM = 1`). Test : `netexec smb <IP_DC> -u '' -p '' --users` doit être refusé.
+- **Constat :** une session anonyme pouvait se connecter au partage `IPC$` du DC et lister les utilisateurs, les groupes et la politique de mot de passe. `RestrictAnonymous` valait 0.
+- **Risque :** l'attaquant récupère sans authentification la liste des comptes et les règles de verrouillage, ce qui lui permet de faire du password spraying en toute sécurité.
+- **Correction, étape 1 :** retrait d'`Everyone` du groupe Pre-Windows 2000 Compatible Access (voir aussi F-03).
+
+![Capture 7 : retrait d'Everyone du groupe Pre-Windows 2000 Compatible Access (1/2)](screenshots/screenshot7)
+*Figure 7 : retrait d'Everyone du groupe Pre-Windows 2000 Compatible Access (1/2).*
+
+![Capture 8 : retrait d'Everyone du groupe Pre-Windows 2000 Compatible Access (2/2)](screenshots/screenshot8)
+*Figure 8 : retrait d'Everyone du groupe Pre-Windows 2000 Compatible Access (2/2).*
+
+- **Correction, étape 2 :** restriction de l'accès anonyme. `RestrictAnonymous` passe de 0 à 2 et `RestrictAnonymousSAM` à 1 (clé `HKLM\SYSTEM\CurrentControlSet\Control\Lsa`). La Default Domain Controllers Policy est mise à jour, puis `gpupdate /force` s'exécute sans erreur.
+
+![Capture 10 : application de la GPO et restriction du registre](screenshots/screenshot10)
+*Figure 10 : application de la GPO des contrôleurs de domaine et restriction de l'accès anonyme dans le registre.*
+
+- **Impact possible :** des outils ou scripts anciens qui utilisent `IPC$` en anonyme ne marcheront plus. Il faut les repérer avant de déployer.
+- **Vérification :** `RestrictAnonymous = 2` et `RestrictAnonymousSAM = 1` sont confirmés, et seul `Authenticated Users` reste dans le groupe. Test possible : `netexec smb <IP_DC> -u '' -p '' --users` doit être refusé.
+
+![Capture 11 : vérification du registre et du groupe](screenshots/screenshot11)
+*Figure 11 : vérification des valeurs de registre et du groupe (Authenticated Users uniquement).*
 
 #### F-02 : Opérations LDAP anonymes autorisées (`dSHeuristics`)
-**Criticité :** Élevée · **Preuves :** [12](screenshots/screenshot-12.png), [13](screenshots/screenshot-13.png), [14](screenshots/screenshot-14.png), [15](screenshots/screenshot-15.png), [16](screenshots/screenshot-16.png)
+**Criticité :** Élevée
 
 - **Constat :** le 7ᵉ caractère de `dSHeuristics` (`fLDAPBlockAnonOps`) valait `2`, ce qui autorise les opérations LDAP anonymes sur toute la forêt.
-- **Risque :** énumération de l'annuaire sans identifiant.
-- **Correction :** 7ᵉ caractère remis à `0` en conservant les autres caractères de la chaîne.
-- **Impact possible :** les applications qui interrogent LDAP sans authentification cessent de fonctionner. À identifier et tester.
-- **Vérification :** un bind anonyme est désormais refusé et le scan de contrôle ne remonte plus le constat. Test : `nxc ldap <IP_DC> -u '' -p ''`.
+
+![Capture 12 : lecture de dSHeuristics](screenshots/screenshot12)
+*Figure 12 : lecture de l'attribut `dSHeuristics`, dont le 7ᵉ caractère vaut 2.*
+
+- **Risque :** on peut énumérer l'annuaire sans aucun identifiant.
+- **Correction, étape 1 :** j'ai remis le 7ᵉ caractère à `0` (opérations anonymes bloquées) en gardant les autres caractères de la chaîne.
+
+![Capture 13 : correction de dSHeuristics](screenshots/screenshot13)
+*Figure 13 : 7ᵉ caractère de `dSHeuristics` remis à 0.*
+
+- **Constat complémentaire :** même avec un `dSHeuristics` correct, le groupe Pre-Windows 2000 Compatible Access contenait `Everyone` (S-1-1-0) et `ANONYMOUS LOGON` (S-1-5-7). Ces deux entrées donnent des droits de lecture aux sessions anonymes.
+
+![Capture 14 : membres du groupe Pre-Windows 2000](screenshots/screenshot14)
+*Figure 14 : membres du groupe avant correction (Everyone et ANONYMOUS LOGON en plus d'Authenticated Users).*
+
+- **Correction, étape 2 :** `Remove-ADGroupMember` par SID a échoué, car ce sont des *well-known SIDs* stockés comme *foreign security principals*. J'ai donc retiré les entrées directement via l'attribut `member` du groupe.
+
+![Capture 15 : retrait des membres via l'attribut member](screenshots/screenshot15)
+*Figure 15 : retrait des deux entrées en modifiant l'attribut `member`.*
+
+- **Impact possible :** les applications qui interrogent LDAP sans authentification ne marcheront plus. Il faut les identifier et les tester.
+- **Vérification :** il ne reste que `Authenticated Users` (S-1-5-11) et un bind anonyme est maintenant refusé (test : `nxc ldap <IP_DC> -u '' -p ''`). Le scan de contrôle ne remonte plus le constat.
+
+![Capture 16 : vérification du groupe](screenshots/screenshot16)
+*Figure 16 : vérification finale, seul Authenticated Users reste dans le groupe.*
 
 #### F-03 : Appartenance au groupe Pre-Windows 2000 Compatible Access
-**Criticité :** Moyenne · **Preuves :** [20](screenshots/screenshot-20.png), [21](screenshots/screenshot-21.png), [22](screenshots/screenshot-22.png)
+**Criticité :** Moyenne
 
-- **Constat :** le groupe contenait `Everyone` (S-1-1-0) et `ANONYMOUS LOGON` (S-1-5-7) en plus d'`Authenticated Users` (S-1-5-11).
-- **Risque :** ces deux identités donnent un droit de lecture de l'annuaire à des utilisateurs non authentifiés, ce qui facilite la reconnaissance.
-- **Correction :** retrait des deux SID. Le paramètre `EveryoneIncludesAnonymous` a été contrôlé et vaut `0`, afin que Windows ne réintègre pas ces identités.
-- **Impact possible :** certains outils d'identité hérités et BloodHound en mode anonyme perdent leur accès.
-- **Vérification :** seul `Authenticated Users` subsiste dans le groupe. Test : réénumération anonyme infructueuse.
+- **Constat :** j'ai listé les membres du groupe avec `Get-ADGroupMember`. Il y avait `Everyone` et `ANONYMOUS LOGON` en plus d'`Authenticated Users`.
+
+![Capture 20 : liste des membres du groupe](screenshots/screenshot20)
+*Figure 20 : liste des membres du groupe Pre-Windows 2000 Compatible Access avec `Get-ADGroupMember`.*
+
+- **Risque :** ces deux identités donnent un droit de lecture de l'annuaire à des utilisateurs non authentifiés, donc ils peuvent lister les comptes et groupes du domaine.
+- **Correction :** retrait des deux entrées. J'ai aussi vérifié que `EveryoneIncludesAnonymous` vaut `0`, pour que Windows ne remette pas ces identités dans le groupe.
+
+![Capture 21 : retrait des membres](screenshots/screenshot21)
+*Figure 21 : retrait d'Everyone et d'ANONYMOUS LOGON du groupe.*
+
+- **Impact possible :** certains outils d'identité anciens et BloodHound en mode anonyme perdent leur accès.
+- **Vérification :** seul `Authenticated Users` (S-1-5-11) reste. Test possible : une nouvelle énumération anonyme doit échouer.
+
+![Capture 22 : vérification du groupe](screenshots/screenshot22)
+*Figure 22 : vérification, seul Authenticated Users (S-1-5-11) reste membre du groupe.*
 
 #### F-04 : RID brute force possible
-**Criticité :** Moyenne · **Preuves :** [36](screenshots/screenshot-36.png), [37](screenshots/screenshot-37.png), [38](screenshots/screenshot-38.png)
+**Criticité :** Moyenne
 
-- **Constat :** la traduction anonyme SID/nom et l'application des permissions `Everyone` aux anonymes permettaient de deviner les comptes en parcourant les RID.
-- **Risque :** reconstitution de la liste des utilisateurs et groupes sans authentification.
-- **Correction :** dans la GPO des contrôleurs de domaine, *Network access: Allow anonymous SID/Name translation* sur **Disabled** et *Network access: Let Everyone permissions apply to anonymous users* sur **Disabled**.
-- **Impact possible :** certaines requêtes légitimes peuvent être bloquées. Pour le RID brute force, la détection reste complémentaire à la prévention.
+- **Constat :** la traduction anonyme SID/nom et l'application des permissions `Everyone` aux anonymes permettaient de retrouver les comptes en parcourant les RID.
+- **Risque :** l'attaquant reconstitue la liste des utilisateurs et des groupes sans s'authentifier.
+- **Correction, étape 1 :** configuration de la GPO des contrôleurs de domaine.
+
+![Capture 36 : configuration de la GPO](screenshots/screenshot36)
+*Figure 36 : configuration de la GPO des contrôleurs de domaine (Security Options).*
+
+- **Correction, étape 2 :** *Network access: Allow anonymous SID/Name translation* mis sur **Disabled**.
+
+![Capture 37 : Allow anonymous SID/Name translation désactivé](screenshots/screenshot37)
+*Figure 37 : désactivation de la traduction anonyme SID/nom.*
+
+- **Correction, étape 3 :** *Network access: Let Everyone permissions apply to anonymous users* mis sur **Disabled**.
+
+![Capture 38 : Let Everyone permissions désactivé](screenshots/screenshot38)
+*Figure 38 : désactivation de l'application des permissions Everyone aux utilisateurs anonymes.*
+
+- **Impact possible :** certaines requêtes légitimes peuvent être bloquées. Pour le RID brute force, la détection reste un bon complément à la prévention.
 - **Vérification :** test `netexec smb <IP_DC> -u '' -p '' --rid-brute`, qui ne doit plus rien retourner.
 
 ### Thème B : usurpation de réponses de résolution de noms
 
 #### F-05 : LLMNR actif
-**Criticité :** Élevée · **Preuves :** [59](screenshots/screenshot-59.png), [60](screenshots/screenshot-60.png), [61](screenshots/screenshot-61.png)
+**Criticité :** Élevée
 
-- **Constat :** LLMNR n'était pas désactivé sur les hôtes du domaine.
-- **Risque :** un attaquant répond aux requêtes de résolution de noms et capture des hashes NTLM, ensuite craquables ou relayables.
-- **Correction :** `EnableMulticast = 0` appliqué immédiatement, puis rendu durable par la GPO dédiée **Disable LLMNR** liée à la racine du domaine.
-- **Impact possible :** la résolution de noms sans DNS fiable est affectée. Un DNS fiable doit exister avant désactivation.
-- **Vérification :** valeur relue sur DC01 et MS01. **À noter :** désactiver LLMNR seul est insuffisant, Windows se rabat sur NBT-NS (F-06). Test : Responder en mode analyse (`responder -I <interface> -A`) ne doit plus voir de requêtes LLMNR exploitables.
+- **Constat :** LLMNR n'était pas désactivé sur les machines du domaine.
+- **Risque :** un attaquant répond aux requêtes de résolution de noms et capture des hashes NTLM, qu'il peut ensuite craquer ou relayer.
+- **Correction immédiate :** j'ai posé `EnableMulticast = 0` dans `HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient` sur DC01 et MS01.
+
+![Capture 59 : remédiation immédiate LLMNR](screenshots/screenshot59)
+*Figure 59 : remédiation immédiate, `EnableMulticast = 0` sur les machines.*
+
+- **Correction durable :** GPO dédiée **Disable LLMNR**, liée à la racine du domaine.
+
+![Capture 60 : GPO Disable LLMNR](screenshots/screenshot60)
+*Figure 60 : réglage durable avec la GPO Disable LLMNR.*
+
+- **Impact possible :** la résolution de noms sans DNS fiable est affectée. Il faut un DNS fiable avant de désactiver LLMNR.
+- **Vérification :** valeur relue sur DC01 et MS01. **À noter :** désactiver LLMNR seul ne suffit pas, car Windows se rabat sur NBT-NS (voir F-06). Test possible : Responder en mode analyse (`responder -I <interface> -A`) ne doit plus voir de requêtes LLMNR exploitables.
+
+![Capture 61 : vérification finale LLMNR](screenshots/screenshot61)
+*Figure 61 : vérification finale de la désactivation de LLMNR.*
 
 #### F-06 : NBT-NS (NetBIOS sur TCP/IP) actif
-**Criticité :** Élevée · **Preuves :** [62](screenshots/screenshot-62.png), [63](screenshots/screenshot-63.png), [64](screenshots/screenshot-64.png)
+**Criticité :** Élevée
 
 - **Constat :** NetBIOS sur TCP/IP était actif sur les cartes réseau.
+
+![Capture 62 : audit initial NBT-NS](screenshots/screenshot62)
+*Figure 62 : audit initial, NetBIOS sur TCP/IP actif sur les cartes réseau.*
+
 - **Risque :** même scénario que LLMNR : usurpation de réponse, capture de hashes, relais.
-- **Correction :** `TcpipNetbiosOptions = 2` sur toutes les cartes de DC01 et MS01, puis réglage rendu durable.
-- **Impact possible :** résolution héritée (imprimantes, scanners, serveurs multi-homed) à vérifier.
-- **Vérification :** relecture de `TcpipNetbiosOptions` sur chaque carte, y compris celle du VPN du lab. Une seule carte non traitée suffit à faire échouer le contrôle.
+- **Correction immédiate :** `TcpipNetbiosOptions = 2` sur toutes les cartes de DC01 et MS01.
+
+![Capture 63 : remédiation immédiate NBT-NS](screenshots/screenshot63)
+*Figure 63 : remédiation immédiate, NetBIOS désactivé sur toutes les cartes.*
+
+- **Correction durable :** réglage rendu persistant.
+
+![Capture 64 : remédiation durable NBT-NS](screenshots/screenshot64)
+*Figure 64 : remédiation durable de la désactivation de NetBIOS.*
+
+- **Impact possible :** la résolution de noms ancienne (imprimantes, scanners, serveurs avec plusieurs cartes) est à vérifier.
+- **Vérification :** relecture de `TcpipNetbiosOptions` sur chaque carte, y compris celle du VPN du lab. Une seule carte oubliée suffit à faire échouer le contrôle.
 
 #### F-07 : Usurpation DNS via IPv6 (mitm6)
-**Criticité :** Élevée · **Preuves :** captures [41](screenshots/screenshot-41.png), [42](screenshots/screenshot-42.png), [43](screenshots/screenshot-43.png), [44](screenshots/screenshot-44.png), [45](screenshots/screenshot-45.png), [46](screenshots/screenshot-46.png), [47](screenshots/screenshot-47.png), [48](screenshots/screenshot-48.png), [49](screenshots/screenshot-49.png), [50](screenshots/screenshot-50.png), [51](screenshots/screenshot-51.png), [52](screenshots/screenshot-52.png)
+**Criticité :** Élevée
 
-- **Constat :** IPv6 était actif et préféré à IPv4 alors qu'aucun service DHCPv6 légitime n'existe. Un attaquant peut se déclarer serveur DNS IPv6 et détourner les requêtes.
+- **Constat :** IPv6 était actif et préféré à IPv4, alors qu'il n'y a aucun serveur DHCPv6 légitime. Un attaquant peut se faire passer pour le serveur DNS IPv6 et détourner les requêtes. J'ai fait l'audit en cinq étapes.
+
+![Capture 41 : IPv6 sur les cartes réseau](screenshots/screenshot41)
+*Figure 41 : vérification d'IPv6 sur les cartes réseau.*
+
+![Capture 42 : adresses IPv6](screenshots/screenshot42)
+*Figure 42 : identification des adresses IPv6 attribuées.*
+
+![Capture 43 : serveurs DNS IPv6](screenshots/screenshot43)
+*Figure 43 : identification des serveurs DNS IPv6 configurés.*
+
+![Capture 44 : configuration IPv6 complète](screenshots/screenshot44)
+*Figure 44 : vue d'ensemble de la configuration IPv6.*
+
+![Capture 45 : test d'injection DNS via IPv6](screenshots/screenshot45)
+*Figure 45 : test pour savoir si le DNS peut être injecté via IPv6.*
+
 - **Risque :** capture de hashes ou relais NTLM (SMB, LDAP) à partir de l'usurpation du DNS IPv6.
-- **Correction :** Router Discovery désactivé sur les interfaces ; `DisabledComponents = 255` sur DC01 et MS01 ; liaison `ms_tcpip6` désactivée sur les cartes ; GPO **Disable IPv6** à la racine ; règles de pare-feu bloquant DHCPv6 (entrée et sortie) et les Router Advertisements.
-- **Impact possible :** **Microsoft déconseille de désactiver IPv6** sans tests approfondis : risque sur le DNS intégré à AD, Kerberos et le clustering. L'effet complet de `DisabledComponents` n'est effectif qu'après redémarrage.
-- **Vérification :** valeur confirmée à 255 sur DC01 et MS01, contrôle du tableau de bord repassé en remédié. Test : `mitm6 -d wyrmwood.local` en lab ne doit plus obtenir de réponse DHCPv6 ni détourner le DNS.
-- **Recommandation production :** privilégier `DisabledComponents = 0x20` (préférer IPv4) combiné au blocage de DHCPv6 et des Router Advertisements, plutôt qu'une désactivation complète.
+- **Correction, étape 1 :** Router Discovery désactivé sur les interfaces Ethernet0 2 et Ethernet1 (`Set-NetIPInterface -RouterDiscovery Disabled`).
+
+![Capture 46 : désactivation de Router Discovery](screenshots/screenshot46)
+*Figure 46 : désactivation de Router Discovery sur les deux interfaces.*
+
+![Capture 47 : vérification de Router Discovery](screenshots/screenshot47)
+*Figure 47 : vérification des modifications avec `Get-NetIPInterface`.*
+
+- **Correction, étape 2 :** `DisabledComponents = 255`. Cette valeur n'est appliquée qu'après un redémarrage, que je ne pouvais pas faire sur HackTheBox.
+
+![Capture 48 : DisabledComponents à 255](screenshots/screenshot48)
+*Figure 48 : IPv6 désactivé via la valeur de registre `DisabledComponents = 255`.*
+
+![Capture 49 : vérification de DisabledComponents](screenshots/screenshot49)
+*Figure 49 : vérification de la valeur dans le registre.*
+
+- **Correction, étape 3 :** désactivation de la liaison `ms_tcpip6` sur les cartes, qui s'applique tout de suite, sans redémarrage.
+
+![Capture 50 : désactivation de la liaison IPv6](screenshots/screenshot50)
+*Figure 50 : désactivation de la liaison IPv6 sur les cartes, puis vérification.*
+
+- **Correction, étape 4 :** extension à tout le domaine avec la GPO **Disable IPv6**, liée à la racine. Comme la GPO n'était pas encore appliquée sur MS01, j'ai aussi posé la valeur directement sur cette machine.
+
+![Capture 51 : GPO Disable IPv6](screenshots/screenshot51)
+*Figure 51 : application de la valeur à toutes les machines avec la GPO Disable IPv6.*
+
+- **Correction, étape 5 :** règles de pare-feu pour bloquer DHCPv6 (entrée et sortie) et les Router Advertisements, ce qui empêche l'attaquant de se faire passer pour le serveur DNS IPv6.
+
+![Capture 52 : blocage de DHCPv6 et des Router Advertisements](screenshots/screenshot52)
+*Figure 52 : blocage de DHCPv6 et des Router Advertisements par le pare-feu.*
+
+- **Impact possible :** **Microsoft déconseille de désactiver IPv6** sans tests poussés, car cela peut gêner le DNS intégré à AD, Kerberos et le clustering.
+- **Vérification :** valeur confirmée à 255 sur DC01 et MS01, et le contrôle du tableau de bord est passé en remédié. Test possible : `mitm6 -d wyrmwood.local` en lab ne doit plus obtenir de réponse DHCPv6 ni détourner le DNS.
+- **Recommandation pour la production :** plutôt qu'une désactivation complète, utiliser `DisabledComponents = 0x20` (préférer IPv4) avec le blocage de DHCPv6 et des Router Advertisements.
 
 ### Thème C : relais NTLM
 
 #### F-08 : Signature SMB non exigée
-**Criticité :** Élevée · **Preuves :** [53](screenshots/screenshot-53.png), [54](screenshots/screenshot-54.png), [55](screenshots/screenshot-55.png)
+**Criticité :** Élevée
 
-- **Constat :** DC01 exige déjà la signature (comportement par défaut d'un DC), mais **MS01 ne l'exigeait pas** (`RequireSecuritySignature` et `EnableSecuritySignature` à `False`).
-- **Risque :** relais d'une authentification obtenue par usurpation ou coercion vers un hôte SMB, avec exécution de code possible.
-- **Correction :** signature exigée côté serveur et côté client, appliquée en direct sur MS01 puis par la GPO **Require SMB Signing**. Les 4 valeurs de registre (`RequireSecuritySignature` et `EnableSecuritySignature` sous `LanmanServer` et `LanmanWorkstation`) ont dû être posées à 1.
-- **Impact possible :** les anciens clients ou appareils non conformes ne peuvent plus se connecter. Tester la compatibilité et les performances.
-- **Vérification :** 4 valeurs à `1` sur DC01 et MS01, contrôle du tableau de bord remédié. Test : `nmap -p445 --script smb2-security-mode <IP>` doit afficher « signing enabled and required ».
+- **Constat :** DC01 exige déjà la signature (comportement par défaut d'un DC).
+
+![Capture 53 : audit initial de la signature SMB](screenshots/screenshot53)
+*Figure 53 : audit initial sur DC01, `RequireSecuritySignature` et `EnableSecuritySignature` à True.*
+
+- **Constat, suite :** **MS01 ne l'exigeait pas** (`False` pour les deux valeurs), c'est lui le point faible.
+
+![Capture 54 : MS01 vulnérable](screenshots/screenshot54)
+*Figure 54 : MS01 vulnérable, signature SMB non exigée.*
+
+- **Risque :** relais d'une authentification obtenue par usurpation ou coercion vers une machine SMB, avec possibilité d'exécuter du code.
+- **Correction :** signature exigée côté serveur et côté client, appliquée directement sur MS01 puis rendue durable avec la GPO **Require SMB Signing**. Le tableau de bord indiquait « At least one setting is 0 » : j'ai dû poser les 4 valeurs de registre à 1 (`RequireSecuritySignature` et `EnableSecuritySignature` sous `LanmanServer` et `LanmanWorkstation`).
+
+![Capture 55 : GPO Require SMB Signing](screenshots/screenshot55)
+*Figure 55 : création de la GPO Require SMB Signing pour le réglage durable.*
+
+- **Impact possible :** les anciens clients ou appareils non conformes ne pourront plus se connecter. Il faut tester la compatibilité et les performances.
+- **Vérification :** les 4 valeurs sont à `1` sur DC01 et MS01, et le contrôle est passé en remédié. Test possible : `nmap -p445 --script smb2-security-mode <IP>` doit afficher « signing enabled and required ».
 
 #### F-09 : Signature LDAP non exigée
-**Criticité :** **Critique** · **Preuves :** [56](screenshots/screenshot-56.png), [57](screenshots/screenshot-57.png), [58](screenshots/screenshot-58.png)
+**Criticité :** **Critique**
 
 - **Constat :** `LDAPServerIntegrity` valait `1` (signature seulement négociée), ce qui reste vulnérable.
-- **Risque :** relais NTLM vers LDAP permettant l'énumération, la création d'un compte machine contrôlé et l'escalade de privilèges.
-- **Correction :** `LDAPServerIntegrity = 2` immédiatement dans le registre de DC01, puis GPO **Require LDAP Signing** liée à l'UO Domain Controllers.
-- **Impact possible :** les applications utilisant un simple bind LDAP en clair (port 389) cessent de fonctionner. LDAPS (636) n'est pas concerné. **Passer d'abord en mode audit** (événement 2889) avant d'exiger la signature en production.
-- **Vérification :** valeur relue à `2`, GPO appliquée au DC (`gpresult /r /scope:computer`), aucune autre GPO ne l'écrase. Test : `nxc ldap <IP_DC> -u <user> -p <pass> -M ldap-checker`.
-- **Complément recommandé :** `LdapEnforceChannelBinding = 2` pour couvrir LDAPS.
+
+![Capture 56 : audit initial de la signature LDAP](screenshots/screenshot56)
+*Figure 56 : audit initial, `LDAPServerIntegrity = 1` sur DC01.*
+
+- **Risque :** relais NTLM vers LDAP, qui permet d'énumérer le domaine, de créer un compte machine contrôlé et d'escalader les privilèges.
+- **Correction immédiate :** `LDAPServerIntegrity = 2` dans le registre de DC01.
+
+![Capture 57 : remédiation immédiate](screenshots/screenshot57)
+*Figure 57 : remédiation immédiate, `LDAPServerIntegrity` passé à 2.*
+
+- **Correction durable :** GPO **Require LDAP Signing** liée à l'UO Domain Controllers.
+
+![Capture 58 : GPO Require LDAP Signing](screenshots/screenshot58)
+*Figure 58 : réglage durable avec la GPO Require LDAP Signing.*
+
+- **Impact possible :** les applications qui font un simple bind LDAP en clair (port 389) ne marcheront plus. LDAPS (636) n'est pas concerné. En production, il faut **passer d'abord en mode audit** (événement 2889) avant d'exiger la signature.
+- **Vérification :** valeur relue à `2`, GPO appliquée au DC (`gpresult /r /scope:computer`) et aucune autre GPO ne l'écrase. Test possible : `nxc ldap <IP_DC> -u <user> -p <pass> -M ldap-checker`.
+- **Complément recommandé :** `LdapEnforceChannelBinding = 2` pour couvrir aussi LDAPS.
 
 #### F-10 : MachineAccountQuota par défaut
-**Criticité :** Élevée · **Preuves :** [1](screenshots/screenshot-1.png), [2](screenshots/screenshot-2.png), [3](screenshots/screenshot-3.png)
+**Criticité :** Élevée
 
-- **Constat :** `ms-DS-Machine-Account-Quota` valait 10 : tout utilisateur du domaine peut créer jusqu'à 10 comptes machine.
-- **Risque :** combiné à un relais vers LDAP, l'attaquant crée un compte contrôlé et s'authentifie sans casser de hash (RBCD et variantes).
+- **Constat :** après connexion au DC en bureau à distance, j'ai lu `ms-DS-Machine-Account-Quota`. Il vaut 10 : n'importe quel utilisateur du domaine peut créer jusqu'à 10 comptes machine.
+
+![Capture 1 : connexion au DC](screenshots/screenshot1)
+*Figure 1 : connexion au contrôleur de domaine par bureau à distance.*
+
+![Capture 2 : valeur actuelle du quota](screenshots/screenshot2)
+*Figure 2 : lecture de la valeur actuelle de `ms-DS-Machine-Account-Quota`.*
+
+- **Risque :** combiné à un relais vers LDAP, l'attaquant crée un compte qu'il contrôle et s'authentifie sans casser de hash (RBCD et variantes).
 - **Correction :** valeur passée à 0 (`Set-ADDomain ... -Replace @{"ms-DS-Machine-Account-Quota"="0"}`).
-- **Impact possible :** les utilisateurs standard ne peuvent plus joindre de machines. Déléguer le droit « Créer des objets Ordinateur » à un groupe dédié (ex. « Opérateurs de jonction de domaine ») sur l'UO concernée.
-- **Vérification :** relecture de l'attribut avec `Get-ADObject ... -Properties ms-DS-Machine-Account-Quota`. La modification se réplique aux autres DC selon le calendrier habituel.
+
+![Capture 3 : quota passé à 0](screenshots/screenshot3)
+*Figure 3 : passage de `ms-DS-Machine-Account-Quota` à 0 et vérification.*
+
+- **Impact possible :** les utilisateurs standard ne peuvent plus joindre de machines au domaine. Il faut déléguer le droit « Créer des objets Ordinateur » à un groupe dédié (par exemple « Opérateurs de jonction de domaine ») sur l'UO concernée.
+- **Vérification :** relecture de l'attribut avec `Get-ADObject ... -Properties ms-DS-Machine-Account-Quota`. La modification se réplique aux autres DC selon le calendrier habituel, donc un autre DC peut afficher un moment l'ancienne valeur.
 
 ### Thème D : identités et authentification
 
 #### F-11 : Mots de passe faibles autorisés
-**Criticité :** Élevée · **Preuves :** [4](screenshots/screenshot-4.png), [5](screenshots/screenshot-5.png), [6](screenshots/screenshot-6.png)
+**Criticité :** Élevée
 
-- **Constat :** la politique ne s'opposait pas au password spraying (mots de passe courts ou simples, pas de verrouillage).
-- **Risque :** compromission de comptes par un mot de passe commun testé sur tous les utilisateurs.
-- **Correction (GPO) :** longueur minimale 12 à 14, complexité activée, ancienneté maximale 60 à 90 jours, historique de 24, ancienneté minimale 1 jour ; verrouillage après 5 à 10 tentatives, durée de 15 min, réinitialisation du compteur à 15 min ; `gpupdate /force`.
-- **Impact possible :** changements forcés de mot de passe et échecs sur les comptes de service ou partagés. Les inventorier au préalable.
-- **Vérification :** relecture de la politique effective après `gpupdate`. Test : un password spraying en lab doit déclencher le verrouillage.
+- **Constat :** la politique n'empêchait pas le password spraying (mots de passe courts ou simples, pas de verrouillage).
+- **Risque :** un compte peut être compromis avec un mot de passe courant testé sur tous les utilisateurs.
+- **Correction, étape 1 : stratégie de mot de passe (GPO).** Longueur minimale 12 à 14, complexité activée, ancienneté maximale 60 à 90 jours, historique de 24, ancienneté minimale 1 jour.
+
+![Capture 4 : GPO stratégie de mot de passe](screenshots/screenshot4)
+*Figure 4 : GPO, stratégie de mot de passe renforcée.*
+
+- **Correction, étape 2 : stratégie de verrouillage de compte.** Seuil de 5 à 10 tentatives, durée de 15 min, réinitialisation du compteur à 15 min.
+
+![Capture 5 : GPO verrouillage de compte](screenshots/screenshot5)
+*Figure 5 : GPO, stratégie de verrouillage de compte.*
+
+- **Correction, étape 3 : application** avec `gpupdate /force`.
+
+![Capture 6 : application des stratégies](screenshots/screenshot6)
+*Figure 6 : application des stratégies avec `gpupdate /force`.*
+
+- **Impact possible :** changements de mot de passe forcés et échecs possibles sur les comptes de service ou partagés. Il faut les recenser avant.
+- **Vérification :** relecture de la politique effective après `gpupdate`. Test possible : un password spraying en lab doit déclencher le verrouillage.
 
 #### F-12 : Politique de mot de passe AD faible
-**Criticité :** Moyenne · **Preuves :** [17](screenshots/screenshot-17.png), [18](screenshots/screenshot-18.png), [19](screenshots/screenshot-19.png)
+**Criticité :** Moyenne
 
-- **Constat :** aucune politique fine (PSO) n'était définie : la politique par défaut du domaine s'applique à tous, comptes privilégiés compris.
-- **Risque :** facilite le brute force et le password spraying.
+- **Constat :** aucune politique fine (PSO) n'était définie, donc la politique par défaut du domaine s'applique à tout le monde, comptes privilégiés compris. La commande de recherche de PSO n'a rien renvoyé, ce qui est normal ici.
+
+![Capture 17 : état actuel de la politique](screenshots/screenshot17)
+*Figure 17 : lecture de la politique de mot de passe actuelle (aucune PSO définie).*
+
+- **Risque :** ça facilite le brute force et le password spraying.
 - **Correction :** politique du domaine renforcée, avec `MaxPasswordAge` à 90 jours pour rester cohérent avec la GPO du constat F-11.
+
+![Capture 18 : correction de la politique](screenshots/screenshot18)
+*Figure 18 : modification de la politique du domaine (`MaxPasswordAge` à 90 jours).*
+
 - **Impact possible :** voir F-11.
-- **Vérification :** relecture de la politique effective. **Recommandation :** créer une politique fine plus stricte pour les comptes privilégiés. Le NIST (SP 800-63B) recommande de privilégier la longueur et le filtrage des mots de passe compromis plutôt que la rotation forcée : à arbitrer.
+- **Vérification :** relecture de la politique effective. **Recommandation :** créer une politique fine plus stricte pour les comptes privilégiés. À noter que le NIST (SP 800-63B) conseille de privilégier la longueur et le filtrage des mots de passe compromis plutôt que le changement forcé régulier : c'est un choix à arbitrer.
+
+![Capture 19 : vérification de la politique](screenshots/screenshot19)
+*Figure 19 : vérification de la politique de mot de passe après modification.*
 
 #### F-13 : Comptes sans pré-authentification Kerberos (AS-REP Roasting)
-**Criticité :** Élevée · **Preuves :** [26](screenshots/screenshot-26.png), [27](screenshots/screenshot-27.png), [28](screenshots/screenshot-28.png)
+**Criticité :** Élevée
 
 - **Constat :** deux comptes, `svc-scan` et `iisadmin`, n'exigeaient pas la pré-authentification Kerberos.
-- **Risque :** un attaquant récupère un TGT chiffré et le casse hors ligne, sans aucun compte.
+
+![Capture 26 : comptes sans pré-authentification](screenshots/screenshot26)
+*Figure 26 : liste des comptes sans pré-authentification Kerberos (`svc-scan` et `iisadmin`).*
+
+- **Risque :** un attaquant peut récupérer un TGT chiffré et le casser hors ligne, sans avoir de compte.
 - **Correction :** `Set-ADAccountControl -DoesNotRequirePreAuth $false` sur les deux comptes.
-- **Impact possible :** des systèmes hérités ou hors domaine peuvent cesser de s'authentifier. Valider les comptes de service.
-- **Vérification :** `Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true}` ne renvoie plus aucun compte. Test : `GetNPUsers.py` (Impacket) ne doit plus retourner de hash. **Recommandation :** réinitialiser le mot de passe de ces deux comptes, par prudence.
+
+![Capture 27 : correction des comptes](screenshots/screenshot27)
+*Figure 27 : réactivation de la pré-authentification Kerberos sur les comptes concernés.*
+
+- **Impact possible :** des systèmes anciens ou hors domaine peuvent ne plus s'authentifier. Il faut valider les comptes de service.
+- **Vérification :** `DoesNotRequirePreAuth` est à `False` sur les deux comptes. Test possible : `GetNPUsers.py` (Impacket) ne doit plus retourner de hash. **Recommandation :** réinitialiser le mot de passe de ces deux comptes par prudence.
+
+![Capture 28 : revérification](screenshots/screenshot28)
+*Figure 28 : revérification, `DoesNotRequirePreAuth` défini sur False.*
 
 ### Thème E : services et partages
 
 #### F-14 : Spouleur d'impression actif sur le contrôleur de domaine
-**Criticité :** Élevée · **Preuves :** [29](screenshots/screenshot-29.png), [30](screenshots/screenshot-30.png), [31](screenshots/screenshot-31.png)
+**Criticité :** Élevée
 
-- **Constat :** le service Print Spooler tournait sur le DC alors qu'AD n'en a pas besoin dans cet environnement.
-- **Risque :** coercition d'authentification (PrinterBug) forçant le DC à s'authentifier vers l'attaquant, avec relais NTLM.
+- **Constat :** le service Print Spooler tournait sur le DC, alors qu'AD n'en a pas besoin dans cet environnement.
+
+![Capture 29 : état du service Print Spooler](screenshots/screenshot29)
+*Figure 29 : vérification de l'état du service Print Spooler (en cours d'exécution).*
+
+- **Risque :** coercition d'authentification (PrinterBug) : l'attaquant force le DC à s'authentifier vers lui, puis relaie l'authentification NTLM.
 - **Correction :** `Stop-Service Spooler` puis `Set-Service Spooler -StartupType Disabled`.
-- **Impact possible :** l'impression à distance et les imprimantes déployées par GPO cessent de fonctionner. Sans risque sur un DC ou un serveur non dédié à l'impression.
-- **Vérification :** service arrêté et désactivé. Test : `nxc smb <IP_DC> -M spooler` ne doit plus détecter le service.
+
+![Capture 30 : désactivation du service](screenshots/screenshot30)
+*Figure 30 : arrêt et désactivation du service au démarrage.*
+
+- **Impact possible :** l'impression à distance et les imprimantes déployées par GPO ne marcheront plus. Sans risque sur un DC ou un serveur qui ne sert pas à imprimer.
+- **Vérification :** service arrêté et désactivé. Test possible : `nxc smb <IP_DC> -M spooler` ne doit plus détecter le service.
+
+![Capture 31 : vérification après désactivation](screenshots/screenshot31)
+*Figure 31 : vérification du service après désactivation (arrêté, démarrage désactivé).*
 
 #### F-15 : Partage `Transfer` modifiable par les utilisateurs non privilégiés
-**Criticité :** Élevée · **Preuves :** [32](screenshots/screenshot-32.png), [33](screenshots/screenshot-33.png), [34](screenshots/screenshot-34.png), [35](screenshots/screenshot-35.png)
+**Criticité :** Élevée
 
-- **Constat :** le partage `Transfer` donnait le contrôle total (`Full`) au groupe `Domain Users`.
-- **Risque :** dépôt de fichiers malveillants pour voler des identifiants, modification ou suppression de données, exfiltration.
-- **Correction :** droits `Full` remplacés par `Read` (`Revoke-SmbShareAccess` puis `Grant-SmbShareAccess`), selon le principe du moindre privilège.
-- **Impact possible :** les dossiers partagés, scripts de logon et lecteurs mappés qui écrivent dans ce partage sont à recenser.
-- **Vérification :** `Get-SmbShareAccess -Name Transfer` confirme le droit `Read` seul. **Recommandation :** vérifier aussi les ACL NTFS et lancer un audit trimestriel des partages (PowerHuntShares).
+- **Constat :** j'ai d'abord listé les partages réseau, puis vérifié les droits exacts de chacun. Le partage `Transfer` donnait le contrôle total (`Full`) au groupe `Domain Users`.
+
+![Capture 32 : identification des partages](screenshots/screenshot32)
+*Figure 32 : identification des partages réseau du serveur.*
+
+![Capture 33 : droits exacts du partage](screenshots/screenshot33)
+*Figure 33 : vérification des droits exacts, `Domain Users` en `Full` sur `Transfer`.*
+
+- **Risque :** dépôt de fichiers piégés pour voler des identifiants, modification ou suppression de données, exfiltration.
+- **Correction :** j'ai remplacé `Full` par `Read` (`Revoke-SmbShareAccess` puis `Grant-SmbShareAccess`), selon le principe du moindre privilège.
+
+![Capture 34 : correction du partage Transfer](screenshots/screenshot34)
+*Figure 34 : correction du partage `Transfer`, droits Full remplacés par Read.*
+
+- **Impact possible :** les dossiers partagés, scripts de connexion et lecteurs réseau qui écrivent dans ce partage sont à recenser.
+- **Vérification :** `Get-SmbShareAccess -Name Transfer` confirme le droit `Read` seul. **Recommandation :** vérifier aussi les ACL NTFS et faire un audit des partages chaque trimestre (PowerHuntShares).
+
+![Capture 35 : vérification des permissions](screenshots/screenshot35)
+*Figure 35 : vérification des permissions SMB après correction (plus de droit d'écriture).*
 
 ---
 
-## 8. Plan d'action proposé
+## 8. Pour aller plus loin : déploiement en production
 
-Ce plan décrit le déploiement en production des corrections validées en laboratoire.
+Dans une vraie entreprise, je déploierais ces corrections en trois vagues.
 
-**Vague 1 : gains rapides, faible risque de régression (0 à 30 jours)**
-- F-14 désactiver le spouleur sur tous les DC et serveurs non dédiés à l'impression.
-- F-13 corriger les comptes sans pré-authentification et réinitialiser leurs mots de passe.
-- F-15 revoir les droits des partages ouverts et auditer l'ensemble des partages.
-- F-03 et F-04 retirer `Everyone` et `ANONYMOUS LOGON` de Pre-Windows 2000 et durcir la traduction SID/nom.
-- F-05 désactiver LLMNR par GPO dédiée (après contrôle du DNS).
+**Vague 1 : gains rapides, peu de risque de casse (0 à 30 jours)**
+- F-14 : désactiver le spouleur sur tous les DC et serveurs qui n'impriment pas.
+- F-13 : corriger les comptes sans pré-authentification et changer leurs mots de passe.
+- F-15 : revoir les droits des partages ouverts et auditer tous les partages.
+- F-03 et F-04 : retirer `Everyone` et `ANONYMOUS LOGON` de Pre-Windows 2000 et durcir la traduction SID/nom.
+- F-05 : désactiver LLMNR avec une GPO dédiée (après avoir vérifié le DNS).
 
-**Vague 2 : changements avec phase d'audit préalable (30 à 60 jours)**
-- F-09 signature LDAP : audit des binds non signés (événement 2889), correction des applications, puis exigence de signature et channel binding.
-- F-08 signature SMB sur tous les serveurs et postes, après inventaire des clients anciens.
-- F-06 désactiver NBT-NS, après inventaire des équipements hérités.
-- F-01 et F-02 restreindre l'accès anonyme SMB et LDAP, après inventaire des usages.
-- F-10 MachineAccountQuota à 0, après mise en place du groupe délégué de jonction.
+**Vague 2 : changements qui demandent un audit avant (30 à 60 jours)**
+- F-09 : audit des binds LDAP non signés (événement 2889), correction des applications, puis signature exigée et channel binding.
+- F-08 : signature SMB partout, après inventaire des clients anciens.
+- F-06 : désactiver NBT-NS, après inventaire des équipements anciens.
+- F-01 et F-02 : restreindre l'accès anonyme SMB et LDAP, après inventaire des usages.
+- F-10 : MachineAccountQuota à 0, après avoir créé le groupe délégué pour joindre les machines.
 
-**Vague 3 : chantiers structurants (60 à 90 jours)**
-- F-07 IPv6 : tests approfondis, puis `DisabledComponents = 0x20` et filtrage DHCPv6 / Router Advertisements.
-- F-11 et F-12 politique de mot de passe renforcée, politiques fines pour les comptes privilégiés, filtre de mots de passe compromis, MFA.
+**Vague 3 : chantiers plus lourds (60 à 90 jours)**
+- F-07 : tests poussés sur IPv6, puis `DisabledComponents = 0x20` et filtrage de DHCPv6 et des Router Advertisements.
+- F-11 et F-12 : politique de mot de passe renforcée, politiques fines pour les comptes privilégiés, filtre de mots de passe compromis, MFA.
 
 **En continu**
 - Audit NTLM (`AuditNTLMInDomain`), puis restriction progressive de NTLM.
-- GPO de référence de durcissement appliquée dès la création de tout nouveau domaine ou serveur.
-- Audits périodiques de l'AD (outil de type PingCastle ou Purple Knight) et des partages.
-- Supervision et alertes sur les authentifications anormales et le brute force RID.
-- Gestion de changement : toute remédiation testée avant déploiement.
+- GPO de durcissement de référence dès la création d'un nouveau domaine ou serveur.
+- Audits réguliers de l'AD (par exemple PingCastle ou Purple Knight) et des partages.
+- Supervision et alertes sur les authentifications anormales et le RID brute force.
+- Chaque correction testée avant déploiement.
 
 ---
 
-## 9. Risques de régression et précautions
+## 9. Précautions avant d'appliquer ces corrections
 
-Les recommandations d'un audit ne doivent pas être appliquées aveuglément : chacune peut casser un usage métier. Points d'attention principaux :
+Les recommandations d'un audit ne doivent pas être appliquées sans réfléchir : chacune peut casser un usage. Voici les principaux points d'attention :
 
-- **Signature LDAP et SMB** : applications en simple bind LDAP, anciens clients et équipements non conformes. Mode audit d'abord.
-- **NBT-NS et LLMNR** : résolution de noms héritée, imprimantes, scanners, serveurs multi-homed. S'assurer d'un DNS fiable.
+- **Signature LDAP et SMB** : applications en simple bind LDAP, anciens clients et équipements non conformes. Commencer par le mode audit.
+- **NBT-NS et LLMNR** : résolution de noms ancienne, imprimantes, scanners, serveurs avec plusieurs cartes. Avoir un DNS fiable.
 - **IPv6** : DNS intégré à AD, Kerberos, clustering. Éviter la désactivation complète en production.
-- **MachineAccountQuota à 0** : processus de jonction au domaine à adapter par délégation.
-- **Accès anonyme** : outils d'administration et d'identité hérités à inventorier.
-- **Spouleur** : sûr uniquement sur les DC et serveurs sans impression.
-- **Politique de mot de passe** : comptes de service et comptes partagés.
+- **MachineAccountQuota à 0** : adapter le processus de jonction au domaine avec une délégation.
+- **Accès anonyme** : repérer les outils d'administration et d'identité anciens.
+- **Spouleur** : sûr seulement sur les DC et serveurs qui n'impriment pas.
+- **Politique de mot de passe** : attention aux comptes de service et comptes partagés.
 
 ---
 
-## 10. Limites et suites
+## 10. Limites
 
-- Les corrections ont été appliquées et vérifiées sur **DC01 et MS01** du domaine `wyrmwood.local`. Les domaines enfants (`ops`, `labs`) et l'approbation de forêt externe (`steelridge.industries`) n'ont pas fait l'objet d'une remédiation dans ce rapport et doivent être traités.
+- Les corrections ont été appliquées et vérifiées sur **DC01 et MS01** du domaine `wyrmwood.local`. Les domaines enfants (`ops`, `labs`) et l'approbation de forêt externe (`steelridge.industries`) n'ont pas été traités dans ce rapport.
 - Le périmètre n'inclut pas AD CS, les postes clients ni l'environnement hybride.
-- Les criticités sont des estimations qualitatives.
-- Suite recommandée : un test de contrôle après déploiement de chaque vague, puis un audit annuel.
+- Les niveaux de criticité sont des estimations qualitatives.
+- Sur HackTheBox je n'ai pas pu redémarrer les machines, donc l'effet complet de `DisabledComponents` (F-07) n'a pas été testé après redémarrage.
+
+---
+
+## 11. Aide de l'IA
+
+Pour ce rapport, j'ai utilisé une IA générattive pour **réorganiser le contenu et corriger les fautes** d'orthographe et de formulation. Le lab, les manipulations ont été aider pour reformulation de commandes quelques fois par IA, les captures d'écran et les constats viennent de mon travail pratique. Le rendu n'est pas parfait et peut encore contenir des maladresses.
